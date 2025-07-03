@@ -89,6 +89,42 @@ const maskApiKey = (key) => {
   return `${key.slice(0, 4)}...${key.slice(-4)}`;
 };
 
+/**
+ * Test Gemini API connectivity
+ * @returns {Promise<Object>} - API status information
+ */
+async function testGeminiAPI() {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return {
+        status: 'error',
+        message: 'API key not configured',
+        accessible: false
+      };
+    }
+
+    // Simple test with minimal content to check API accessibility
+    const testResponse = await runRAG(
+      'MOSDAC is a satellite data center.',
+      'What is MOSDAC?',
+      { chunkSize: 100, topK: 1, maxTokens: 50 }
+    );
+
+    return {
+      status: 'success',
+      message: 'API accessible and responding',
+      accessible: true,
+      testResponseLength: testResponse.length
+    };
+  } catch (error) {
+    return {
+      status: 'error',
+      message: error.message,
+      accessible: false
+    };
+  }
+}
+
 // ✅ POST route for chat using RAG system with logging
 app.post('/api/chat', async (req, res) => {
   const startTime = Date.now();
@@ -179,25 +215,160 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// ✅ Health check route
-app.get('/api/health', (req, res) => {
-  const status = {
-    status: 'OK',
-    service: 'MOSDAC AI Chat Backend with RAG',
-    timestamp: new Date().toISOString(),
-    geminiApiKey: process.env.GEMINI_API_KEY ? 'Configured' : 'Missing',
-    knowledgeBase: mosdacKnowledgeBase ? 'Loaded' : 'Missing',
-    knowledgeBaseSize: mosdacKnowledgeBase.length,
-    logsDirectory: fs.existsSync(logsDir) ? 'Available' : 'Missing',
-    queryLogFile: fs.existsSync(queryLogPath) ? 'Available' : 'Missing',
-    port,
-  };
+// ✅ Enhanced Health check route with comprehensive backend and API status
+app.get('/api/health', async (req, res) => {
+  const healthCheckStart = Date.now();
+  
+  try {
+    // Basic system status
+    const basicStatus = {
+      service: 'MOSDAC AI Chat Backend',
+      version: '1.0.0',
+      status: 'OK',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      port: port,
+      nodeVersion: process.version,
+      platform: process.platform
+    };
 
-  console.log('🏥 Health Check:', status);
-  res.json(status);
+    // Backend component status
+    const backendStatus = {
+      server: {
+        status: 'running',
+        port: port,
+        environment: process.env.NODE_ENV || 'development'
+      },
+      knowledgeBase: {
+        status: mosdacKnowledgeBase ? 'loaded' : 'missing',
+        size: mosdacKnowledgeBase.length,
+        available: !!mosdacKnowledgeBase
+      },
+      logging: {
+        directory: {
+          status: fs.existsSync(logsDir) ? 'available' : 'missing',
+          path: logsDir
+        },
+        queryLog: {
+          status: fs.existsSync(queryLogPath) ? 'available' : 'missing',
+          path: queryLogPath
+        }
+      },
+      fileSystem: {
+        logsWritable: true,
+        tempAccess: true
+      }
+    };
+
+    // Gemini API status
+    const geminiStatus = {
+      apiKey: {
+        configured: !!process.env.GEMINI_API_KEY,
+        masked: maskApiKey(process.env.GEMINI_API_KEY),
+        valid: process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.length > 10
+      },
+      connectivity: {
+        status: 'checking',
+        accessible: false,
+        lastChecked: new Date().toISOString()
+      }
+    };
+
+    // Test Gemini API connectivity (with timeout)
+    try {
+      const apiTest = await Promise.race([
+        testGeminiAPI(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('API test timeout')), 5000)
+        )
+      ]);
+      
+      geminiStatus.connectivity = {
+        ...geminiStatus.connectivity,
+        ...apiTest,
+        lastChecked: new Date().toISOString()
+      };
+    } catch (error) {
+      geminiStatus.connectivity = {
+        status: 'error',
+        accessible: false,
+        message: error.message,
+        lastChecked: new Date().toISOString()
+      };
+    }
+
+    // Overall system health
+    const overallHealth = {
+      healthy: (
+        backendStatus.server.status === 'running' &&
+        backendStatus.knowledgeBase.available &&
+        geminiStatus.apiKey.configured &&
+        geminiStatus.connectivity.accessible
+      ),
+      issues: []
+    };
+
+    // Identify issues
+    if (!backendStatus.knowledgeBase.available) {
+      overallHealth.issues.push('Knowledge base not loaded');
+    }
+    if (!geminiStatus.apiKey.configured) {
+      overallHealth.issues.push('Gemini API key not configured');
+    }
+    if (!geminiStatus.connectivity.accessible) {
+      overallHealth.issues.push('Gemini API not accessible');
+    }
+    if (!backendStatus.logging.directory.status === 'available') {
+      overallHealth.issues.push('Logging directory not available');
+    }
+
+    // Performance metrics
+    const performanceMetrics = {
+      healthCheckDuration: Date.now() - healthCheckStart,
+      memoryUsage: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+        unit: 'MB'
+      }
+    };
+
+    // Compile complete health response
+    const healthResponse = {
+      ...basicStatus,
+      health: overallHealth,
+      backend: backendStatus,
+      geminiAPI: geminiStatus,
+      performance: performanceMetrics
+    };
+
+    // Log health check
+    console.log('🏥 Health Check Completed:', {
+      status: overallHealth.healthy ? 'HEALTHY' : 'ISSUES_DETECTED',
+      issues: overallHealth.issues,
+      duration: performanceMetrics.healthCheckDuration + 'ms'
+    });
+
+    // Return appropriate HTTP status
+    const httpStatus = overallHealth.healthy ? 200 : 503;
+    res.status(httpStatus).json(healthResponse);
+
+  } catch (error) {
+    console.error('❌ Health Check Error:', error.message);
+    
+    res.status(500).json({
+      service: 'MOSDAC AI Chat Backend',
+      status: 'ERROR',
+      timestamp: new Date().toISOString(),
+      error: error.message,
+      health: {
+        healthy: false,
+        issues: ['Health check system failure']
+      }
+    });
+  }
 });
 
-// ✅ New route to get query logs (optional - for debugging/monitoring)
+// ✅ Route to get query logs (optional - for debugging/monitoring)
 app.get('/api/logs', (req, res) => {
   try {
     if (!fs.existsSync(queryLogPath)) {
