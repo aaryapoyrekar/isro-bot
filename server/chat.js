@@ -22,6 +22,51 @@ const port = 3002;
 app.use(cors());
 app.use(express.json());
 
+// Ensure logs directory exists
+const logsDir = path.join(__dirname, 'logs');
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+  console.log('📁 Created logs directory');
+}
+
+// Query log file path
+const queryLogPath = path.join(logsDir, 'query_log.json');
+
+// Initialize log file if it doesn't exist
+if (!fs.existsSync(queryLogPath)) {
+  fs.writeFileSync(queryLogPath, '', 'utf-8');
+  console.log('📝 Initialized query log file');
+}
+
+/**
+ * Log query and response to JSON file
+ * @param {string} query - User query
+ * @param {string} response - Bot response
+ * @param {string} status - Request status (success/error)
+ */
+function logQuery(query, response, status = 'success') {
+  try {
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      query: query,
+      response: response,
+      status: status,
+      responseLength: response.length,
+      sessionId: Date.now().toString() // Simple session identifier
+    };
+
+    // Convert log entry to JSON string with newline
+    const logLine = JSON.stringify(logEntry) + '\n';
+    
+    // Append to log file
+    fs.appendFileSync(queryLogPath, logLine, 'utf-8');
+    
+    console.log('📝 Query logged successfully');
+  } catch (error) {
+    console.error('❌ Error logging query:', error.message);
+  }
+}
+
 // Load MOSDAC knowledge base
 let mosdacKnowledgeBase = '';
 
@@ -44,28 +89,40 @@ const maskApiKey = (key) => {
   return `${key.slice(0, 4)}...${key.slice(-4)}`;
 };
 
-// ✅ POST route for chat using RAG system
+// ✅ POST route for chat using RAG system with logging
 app.post('/api/chat', async (req, res) => {
+  const startTime = Date.now();
+  let userQuery = '';
+  let botResponse = '';
+  let requestStatus = 'error';
+
   try {
     const { query } = req.body;
+    userQuery = query || '';
 
     console.log('📨 Incoming chat request:', {
-      query,
+      query: userQuery,
       timestamp: new Date().toISOString(),
     });
 
     console.log('🔑 Gemini API Key status:', maskApiKey(process.env.GEMINI_API_KEY));
 
     if (!query || typeof query !== 'string') {
-      return res.status(400).json({ error: '❌ Query is required and must be a string' });
+      botResponse = '❌ Query is required and must be a string';
+      logQuery(userQuery, botResponse, 'validation_error');
+      return res.status(400).json({ error: botResponse });
     }
 
     if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ answer: '⚠️ Error: Gemini API key not configured' });
+      botResponse = '⚠️ Error: Gemini API key not configured';
+      logQuery(userQuery, botResponse, 'config_error');
+      return res.status(500).json({ answer: botResponse });
     }
 
     if (!mosdacKnowledgeBase) {
-      return res.status(500).json({ answer: '⚠️ Error: MOSDAC knowledge base not available' });
+      botResponse = '⚠️ Error: MOSDAC knowledge base not available';
+      logQuery(userQuery, botResponse, 'knowledge_base_error');
+      return res.status(500).json({ answer: botResponse });
     }
 
     console.log('🚀 Processing query with RAG system...');
@@ -79,26 +136,46 @@ app.post('/api/chat', async (req, res) => {
       maxTokens: 1000
     });
 
+    botResponse = answer;
+    requestStatus = 'success';
+
+    const processingTime = Date.now() - startTime;
     console.log('✅ RAG response generated successfully');
+    console.log(`⏱️ Processing time: ${processingTime}ms`);
     console.log('📊 Response preview:', answer.slice(0, 100) + '...');
 
-    res.json({ answer });
+    // Log successful query and response
+    logQuery(userQuery, botResponse, requestStatus);
+
+    res.json({ answer: botResponse });
 
   } catch (error) {
     console.error('❌ RAG System Error:', error.message);
+    
     let msg = '⚠️ Error: Unable to process your request at the moment';
 
     if (error.message.includes('API_KEY') || error.message.includes('authentication')) {
       msg = '⚠️ Error: Invalid Gemini API key configuration';
+      requestStatus = 'auth_error';
     } else if (error.message.includes('quota')) {
       msg = '⚠️ Error: Gemini API quota exceeded';
+      requestStatus = 'quota_error';
     } else if (error.message.includes('model')) {
       msg = '⚠️ Error: AI model temporarily unavailable';
+      requestStatus = 'model_error';
     } else if (error.message.includes('RAG')) {
       msg = '⚠️ Error: Knowledge retrieval system unavailable';
+      requestStatus = 'rag_error';
+    } else {
+      requestStatus = 'system_error';
     }
 
-    res.json({ answer: msg });
+    botResponse = msg;
+    
+    // Log error query and response
+    logQuery(userQuery, botResponse, requestStatus);
+
+    res.json({ answer: botResponse });
   }
 });
 
@@ -111,11 +188,46 @@ app.get('/api/health', (req, res) => {
     geminiApiKey: process.env.GEMINI_API_KEY ? 'Configured' : 'Missing',
     knowledgeBase: mosdacKnowledgeBase ? 'Loaded' : 'Missing',
     knowledgeBaseSize: mosdacKnowledgeBase.length,
+    logsDirectory: fs.existsSync(logsDir) ? 'Available' : 'Missing',
+    queryLogFile: fs.existsSync(queryLogPath) ? 'Available' : 'Missing',
     port,
   };
 
   console.log('🏥 Health Check:', status);
   res.json(status);
+});
+
+// ✅ New route to get query logs (optional - for debugging/monitoring)
+app.get('/api/logs', (req, res) => {
+  try {
+    if (!fs.existsSync(queryLogPath)) {
+      return res.json({ logs: [], message: 'No logs available' });
+    }
+
+    const logContent = fs.readFileSync(queryLogPath, 'utf-8');
+    const logLines = logContent.trim().split('\n').filter(line => line.length > 0);
+    
+    const logs = logLines.map(line => {
+      try {
+        return JSON.parse(line);
+      } catch (error) {
+        return { error: 'Invalid log entry', raw: line };
+      }
+    });
+
+    // Return last 50 logs for performance
+    const recentLogs = logs.slice(-50);
+
+    res.json({
+      totalLogs: logs.length,
+      recentLogs: recentLogs,
+      logFile: queryLogPath
+    });
+
+  } catch (error) {
+    console.error('❌ Error reading logs:', error.message);
+    res.status(500).json({ error: 'Unable to read logs' });
+  }
 });
 
 // ✅ Start server
@@ -126,5 +238,7 @@ app.listen(port, () => {
   console.log(`🔑 API Key (masked): ${maskApiKey(process.env.GEMINI_API_KEY)}`);
   console.log(`📚 Knowledge Base Status: ${mosdacKnowledgeBase ? 'Loaded' : 'Missing'}`);
   console.log(`📄 Knowledge Base Size: ${mosdacKnowledgeBase.length} characters`);
-  console.log('✅ Ready to receive chat requests with RAG-powered responses');
+  console.log(`📝 Query Logging: ${fs.existsSync(queryLogPath) ? 'Enabled' : 'Disabled'}`);
+  console.log(`📁 Logs Directory: ${logsDir}`);
+  console.log('✅ Ready to receive chat requests with RAG-powered responses and logging');
 });
